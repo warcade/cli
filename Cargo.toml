@@ -1,0 +1,32 @@
+[package]
+name = "webarcade"
+version = "0.4.2"
+edition = "2021"
+description = "CLI for WebArcade - Create and build native desktop app plugins"
+license = "MIT"
+repository = "https://github.com/warcade/cli"
+homepage = "https://github.com/warcade/core"
+keywords = ["webarcade", "plugin", "cli", "desktop", "webview"]
+categories = ["command-line-utilities", "development-tools"]
+readme = "README.md"
+
+[[bin]]
+name = "webarcade"
+path = "src/main.rs"
+
+[dependencies]
+anyhow = "1.0"
+clap = { version = "4.5", features = ["derive"] }
+serde_json = "1.0"
+serde = { version = "1.0", features = ["derive"] }
+toml = "0.8"
+toml_edit = "0.22"
+regex = "1.10"
+dialoguer = { version = "0.11", features = ["fuzzy-select"] }
+console = "0.15"
+
+[profile.release]
+opt-level = "z"
+lto = true
+codegen-units = 1
+strip = true
