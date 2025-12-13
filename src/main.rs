@@ -1621,17 +1621,18 @@ impl PluginBuilder {
         // Generate Cargo.toml
         // API dependency from crates.io with optional bridge feature (only if plugin has routes)
         let api_dep = if has_routes {
-            r#"api = { package = "webarcade-api", version = "0.1", features = ["bridge"] }"#.to_string()
+            r#"webarcade-api = { version = "0.1", features = ["bridge"] }"#.to_string()
         } else {
-            r#"api = { package = "webarcade-api", version = "0.1" }"#.to_string()
+            r#"webarcade-api = "0.1""#.to_string()
         };
 
         let plugin_cargo_toml = self.plugin_dir.join("Cargo.toml");
         let cargo_toml = if plugin_cargo_toml.exists() {
             let mut content = fs::read_to_string(&plugin_cargo_toml)?;
 
-            // Inject API dependency path with appropriate features
-            let re = regex::Regex::new(r#"api\s*=\s*\{[^}]*\}"#)?;
+            // Inject API dependency with appropriate features
+            // Match both old "api = {...}" and new "webarcade-api = ..." patterns
+            let re = regex::Regex::new(r#"(webarcade-api|api)\s*=\s*(\{[^}]*\}|"[^"]*")"#)?;
             content = if re.is_match(&content) {
                 re.replace(&content, &api_dep).to_string()
             } else {
