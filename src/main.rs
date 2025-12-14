@@ -25,7 +25,8 @@ use std::collections::HashMap;
 use std::fs;
 use std::io::Write;
 use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::process::{Command, Stdio};
+use std::io::BufRead;
 use sysinfo::System;
 use walkdir::WalkDir;
 
@@ -1961,6 +1962,10 @@ struct BuildProgress {
     current_plugin: Option<String>,
     current_step: Option<String>,
     spinner: ProgressBar,
+    // Cargo compilation progress
+    cargo_current: usize,
+    cargo_total: usize,
+    cargo_crate_name: Option<String>,
 }
 
 impl BuildProgress {
@@ -2001,13 +2006,20 @@ impl BuildProgress {
             current_plugin: None,
             current_step: None,
             spinner,
+            cargo_current: 0,
+            cargo_total: 0,
+            cargo_crate_name: None,
         }
     }
 
     fn render(&self) {
-        // Clear screen and move to top
+        // Hide cursor and clear screen completely
+        let _ = self.term.hide_cursor();
         let _ = self.term.clear_screen();
         let _ = self.term.move_cursor_to(0, 0);
+        // Also clear scrollback buffer on supported terminals
+        print!("\x1B[3J");
+        let _ = std::io::stdout().flush();
 
         // Header
         println!();
@@ -2054,6 +2066,29 @@ impl BuildProgress {
         // Current action
         if let (Some(plugin), Some(step)) = (&self.current_plugin, &self.current_step) {
             println!("  {} {}: {}", style("→").cyan(), style(plugin).bold(), style(step).dim());
+
+            // Show cargo compilation progress if compiling
+            if step.contains("Compiling") && self.cargo_total > 0 {
+                let cargo_bar_width = 30;
+                let cargo_filled = if self.cargo_total > 0 {
+                    (self.cargo_current * cargo_bar_width) / self.cargo_total
+                } else { 0 };
+                let cargo_empty = cargo_bar_width - cargo_filled;
+
+                let cargo_bar = format!("{}{}",
+                    style("=".repeat(cargo_filled)).cyan(),
+                    style(" ".repeat(cargo_empty)).dim()
+                );
+
+                let crate_display = self.cargo_crate_name.as_deref().unwrap_or("");
+                println!("    {} [{}] {}/{}: {}",
+                    style("Building").dim(),
+                    cargo_bar,
+                    self.cargo_current,
+                    self.cargo_total,
+                    style(crate_display).yellow()
+                );
+            }
         }
 
         // Progress bar
@@ -2094,6 +2129,19 @@ impl BuildProgress {
     fn set_step(&mut self, plugin_id: &str, step: &str) {
         self.current_plugin = Some(plugin_id.to_string());
         self.current_step = Some(step.to_string());
+        // Reset cargo progress when step changes (unless it's still compiling)
+        if !step.contains("Compiling") {
+            self.cargo_current = 0;
+            self.cargo_total = 0;
+            self.cargo_crate_name = None;
+        }
+        self.render();
+    }
+
+    fn update_cargo_progress(&mut self, current: usize, total: usize, crate_name: Option<String>) {
+        self.cargo_current = current;
+        self.cargo_total = total;
+        self.cargo_crate_name = crate_name;
         self.render();
     }
 
@@ -2109,9 +2157,13 @@ impl BuildProgress {
     fn finish(&self) {
         self.spinner.finish_and_clear();
 
-        // Final render
+        // Final render - show cursor and clear screen
+        let _ = self.term.show_cursor();
         let _ = self.term.clear_screen();
         let _ = self.term.move_cursor_to(0, 0);
+        // Clear scrollback buffer
+        print!("\x1B[3J");
+        let _ = std::io::stdout().flush();
 
         println!();
         println!("  {}  {}", style("✓").green().bold(), style("Build Complete").green().bold());
@@ -2808,16 +2860,95 @@ pub extern "C" fn free_plugin_string(ptr: *mut u8) {{
     fn compile_backend(&self) -> Result<()> {
         let rust_build_dir = self.build_dir.join("rust_build");
 
-        // Capture output to avoid cluttering progress display
-        let output = Command::new("cargo")
+        // Spawn cargo with piped stderr to capture progress
+        let mut child = Command::new("cargo")
             .current_dir(&rust_build_dir)
             .args(&["build", "--release", "--lib"])
-            .output()
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
             .context("Failed to run cargo build")?;
 
-        if !output.status.success() {
-            let stderr = String::from_utf8_lossy(&output.stderr);
-            anyhow::bail!("Cargo build failed:\n{}", stderr);
+        // Read stderr to parse progress (cargo outputs progress to stderr)
+        let stderr = child.stderr.take().expect("Failed to capture stderr");
+        let reader = std::io::BufReader::new(stderr);
+
+        let mut compiled_count = 0usize;
+        let mut total_crates = 0usize;
+        let mut error_output = String::new();
+        let mut last_crate_name = String::new();
+
+        for line in reader.lines() {
+            let line = match line {
+                Ok(l) => l,
+                Err(_) => continue,
+            };
+
+            // Parse "Compiling crate_name v0.1.0" lines
+            if line.trim_start().starts_with("Compiling ") {
+                compiled_count += 1;
+                // Extract crate name from "Compiling crate_name v0.1.0 (path)"
+                let parts: Vec<&str> = line.trim_start().splitn(3, ' ').collect();
+                if parts.len() >= 2 {
+                    last_crate_name = parts[1].to_string();
+                }
+
+                // Estimate total based on typical plugin build
+                if total_crates == 0 {
+                    total_crates = 150; // Default estimate
+                }
+                if compiled_count > total_crates {
+                    total_crates = compiled_count + 10; // Adjust if we exceeded estimate
+                }
+
+                // Update progress display
+                let current = compiled_count;
+                let total = total_crates;
+                let crate_name = last_crate_name.clone();
+                with_build_progress(|p| {
+                    p.update_cargo_progress(current, total, Some(crate_name));
+                });
+            }
+            // Parse "Building [=====> ] N/M: crate" progress lines
+            else if line.contains("Building") && line.contains("/") {
+                // Try to extract N/M from progress line like "Building [=====> ] 50/100: crate"
+                if let Some(progress_part) = line.split(']').nth(1) {
+                    let parts: Vec<&str> = progress_part.trim().split(':').collect();
+                    if !parts.is_empty() {
+                        let nums: Vec<&str> = parts[0].trim().split('/').collect();
+                        if nums.len() == 2 {
+                            if let (Ok(current), Ok(total)) = (nums[0].parse::<usize>(), nums[1].parse::<usize>()) {
+                                total_crates = total;
+                                compiled_count = current;
+                                if parts.len() > 1 {
+                                    last_crate_name = parts[1].trim().to_string();
+                                }
+                                let c = compiled_count;
+                                let t = total_crates;
+                                let crate_name = last_crate_name.clone();
+                                with_build_progress(|p| {
+                                    p.update_cargo_progress(c, t, Some(crate_name));
+                                });
+                            }
+                        }
+                    }
+                }
+            }
+            // Capture error lines
+            else if line.contains("error") || line.contains("Error") {
+                error_output.push_str(&line);
+                error_output.push('\n');
+            }
+        }
+
+        // Wait for the process to complete
+        let status = child.wait().context("Failed to wait for cargo build")?;
+
+        if !status.success() {
+            if error_output.is_empty() {
+                error_output = "Cargo build failed (unknown error)".to_string();
+            }
+            anyhow::bail!("Cargo build failed:\n{}", error_output);
         }
 
         // Copy compiled binary
