@@ -18,7 +18,8 @@
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
 use dialoguer::{Input, Select, Confirm, theme::ColorfulTheme};
-use console::style;
+use console::{style, Term};
+use indicatif::{ProgressBar, ProgressStyle};
 use sha2::{Sha256, Digest};
 use std::collections::HashMap;
 use std::fs;
@@ -182,22 +183,145 @@ fn run_command(cmd: Commands) -> Result<()> {
     }
 }
 
+const CURRENT_VERSION: &str = env!("CARGO_PKG_VERSION");
+
+fn check_latest_version() -> Option<String> {
+    // Query crates.io API for latest version
+    let url = "https://crates.io/api/v1/crates/webarcade";
+
+    match ureq::get(url)
+        .set("User-Agent", "webarcade-cli")
+        .call()
+    {
+        Ok(response) => {
+            let body = response.into_string().ok()?;
+            let json: serde_json::Value = serde_json::from_str(&body).ok()?;
+            json.get("crate")
+                .and_then(|c| c.get("max_version"))
+                .and_then(|v| v.as_str())
+                .map(String::from)
+        }
+        Err(_) => None,
+    }
+}
+
+fn compare_cli_versions(current: &str, latest: &str) -> std::cmp::Ordering {
+    let parse = |v: &str| -> Vec<u32> {
+        v.split('.')
+            .filter_map(|s| s.parse().ok())
+            .collect()
+    };
+
+    let current_parts = parse(current);
+    let latest_parts = parse(latest);
+
+    for i in 0..3 {
+        let c = current_parts.get(i).copied().unwrap_or(0);
+        let l = latest_parts.get(i).copied().unwrap_or(0);
+        match c.cmp(&l) {
+            std::cmp::Ordering::Equal => continue,
+            other => return other,
+        }
+    }
+    std::cmp::Ordering::Equal
+}
+
 fn update_cli() -> Result<()> {
-    println!("{}", style("Updating webarcade CLI...").cyan().bold());
+    println!();
+    println!("  {}  {}", style("▶").cyan().bold(), style("WebArcade CLI Update").cyan().bold());
+    println!("  {}", style("─".repeat(50)).dim());
     println!();
 
-    let status = Command::new("cargo")
-        .args(["install", "webarcade", "--force"])
-        .status()
-        .context("Failed to run cargo install")?;
+    // Show current version
+    println!("  Current version: {}", style(CURRENT_VERSION).yellow());
 
-    if status.success() {
-        println!();
-        println!("{}", style("Successfully updated webarcade CLI!").green().bold());
-    } else {
-        anyhow::bail!("Failed to update webarcade CLI");
+    // Check for latest version
+    print!("  Checking for updates... ");
+    std::io::stdout().flush()?;
+
+    match check_latest_version() {
+        Some(latest) => {
+            println!("{}", style("done").green());
+            println!("  Latest version:  {}", style(&latest).green());
+            println!();
+
+            match compare_cli_versions(CURRENT_VERSION, &latest) {
+                std::cmp::Ordering::Less => {
+                    // Update available
+                    println!("  {} Update available: {} → {}",
+                        style("●").yellow().bold(),
+                        style(CURRENT_VERSION).dim(),
+                        style(&latest).green().bold()
+                    );
+                    println!();
+
+                    if Confirm::with_theme(&ColorfulTheme::default())
+                        .with_prompt("  Install update?")
+                        .default(true)
+                        .interact()?
+                    {
+                        println!();
+                        println!("  {} Installing update...", style("→").cyan());
+                        println!();
+
+                        let status = Command::new("cargo")
+                            .args(["install", "webarcade", "--force"])
+                            .status()
+                            .context("Failed to run cargo install")?;
+
+                        if status.success() {
+                            println!();
+                            println!("  {} Successfully updated to v{}!",
+                                style("✓").green().bold(),
+                                style(&latest).green().bold()
+                            );
+                        } else {
+                            anyhow::bail!("Failed to update webarcade CLI");
+                        }
+                    } else {
+                        println!("  Update cancelled.");
+                    }
+                }
+                std::cmp::Ordering::Equal => {
+                    println!("  {} You're already on the latest version!",
+                        style("✓").green().bold()
+                    );
+                }
+                std::cmp::Ordering::Greater => {
+                    println!("  {} You're running a newer version than published (dev build?)",
+                        style("→").cyan()
+                    );
+                }
+            }
+        }
+        None => {
+            println!("{}", style("failed").red());
+            println!();
+            println!("  {} Could not check for updates (no internet?)", style("!").yellow());
+            println!();
+
+            if Confirm::with_theme(&ColorfulTheme::default())
+                .with_prompt("  Try to update anyway?")
+                .default(false)
+                .interact()?
+            {
+                println!();
+                let status = Command::new("cargo")
+                    .args(["install", "webarcade", "--force"])
+                    .status()
+                    .context("Failed to run cargo install")?;
+
+                if status.success() {
+                    println!();
+                    println!("  {} Update complete!", style("✓").green().bold());
+                } else {
+                    anyhow::bail!("Failed to update webarcade CLI");
+                }
+            }
+        }
     }
 
+    println!();
     Ok(())
 }
 
@@ -1709,10 +1833,6 @@ fn build_all_plugins(force: bool) -> Result<()> {
         return Ok(());
     }
 
-    println!();
-    println!("{}", style("Building plugins...").cyan().bold());
-    println!();
-
     // Kill running processes first to avoid file locking issues
     kill_running_app_processes()?;
 
@@ -1733,56 +1853,49 @@ fn build_all_plugins(force: bool) -> Result<()> {
         }
     }
 
-    // Report skipped plugins
-    if !skipped.is_empty() {
-        println!("  {} Skipping {} unchanged plugin(s):", style("→").dim(), skipped.len());
-        for plugin_id in &skipped {
-            println!("    {} {}", style("·").dim(), style(plugin_id).dim());
-        }
-        println!();
-    }
-
     if to_build.is_empty() {
-        println!("{}", style("All plugins are up to date!").green().bold());
+        println!();
+        println!("  {} {}", style("✓").green().bold(), style("All plugins are up to date!").green());
+        println!();
         return Ok(());
     }
 
-    println!("  Building {} plugin(s)...", to_build.len());
-    println!();
+    // Create progress display
+    let mut progress = BuildProgress::new(&to_build, &skipped);
+    progress.render();
 
-    let mut success_count = 0;
-    let mut fail_count = 0;
+    // Set global progress for PluginBuilder to use
+    set_build_progress(Some(&mut progress));
+
+    let mut errors: Vec<(String, String)> = Vec::new();
 
     for plugin_id in &to_build {
-        print!("  {} {}... ", style("→").cyan(), plugin_id);
-        std::io::stdout().flush()?;
+        progress.start_plugin(plugin_id);
 
         match build_plugin_internal(plugin_id) {
             Ok(_) => {
-                println!("{}", style("OK").green());
-                success_count += 1;
+                progress.complete_plugin(plugin_id, true);
             }
             Err(e) => {
-                println!("{}: {}", style("FAILED").red(), e);
-                fail_count += 1;
+                progress.complete_plugin(plugin_id, false);
+                errors.push((plugin_id.clone(), e.to_string()));
             }
         }
     }
 
-    println!();
-    if fail_count > 0 {
-        println!("Results: {} succeeded, {} failed, {} skipped",
-            style(success_count).green(),
-            style(fail_count).red(),
-            style(skipped.len()).dim()
-        );
+    // Clear global progress
+    set_build_progress(None);
+
+    progress.finish();
+
+    // Show errors at the end
+    if !errors.is_empty() {
+        println!("  {}", style("Errors:").red().bold());
+        for (plugin_id, error) in &errors {
+            println!("    {} {}: {}", style("✗").red(), plugin_id, style(error).dim());
+        }
+        println!();
         anyhow::bail!("Some plugins failed to build");
-    } else {
-        println!("{} {} built, {} skipped",
-            style("✓").green(),
-            success_count,
-            skipped.len()
-        );
     }
 
     Ok(())
@@ -1821,6 +1934,269 @@ fn build_plugin_internal(plugin_id: &str) -> Result<()> {
     update_build_cache(plugin_id, &plugin_dir)?;
 
     Ok(())
+}
+
+// ============================================================================
+// Build Progress Display
+// ============================================================================
+
+#[derive(Clone, Copy, PartialEq)]
+enum PluginStatus {
+    Pending,
+    Building,
+    Success,
+    Failed,
+    Skipped,
+}
+
+#[derive(Clone)]
+struct PluginState {
+    id: String,
+    status: PluginStatus,
+}
+
+struct BuildProgress {
+    term: Term,
+    plugins: Vec<PluginState>,
+    current_plugin: Option<String>,
+    current_step: Option<String>,
+    spinner: ProgressBar,
+}
+
+impl BuildProgress {
+    fn new(to_build: &[String], skipped: &[String]) -> Self {
+        let term = Term::stdout();
+
+        // Create plugin states
+        let mut plugins: Vec<PluginState> = to_build
+            .iter()
+            .map(|id| PluginState {
+                id: id.clone(),
+                status: PluginStatus::Pending,
+            })
+            .collect();
+
+        // Add skipped plugins
+        for id in skipped {
+            plugins.push(PluginState {
+                id: id.clone(),
+                status: PluginStatus::Skipped,
+            });
+        }
+
+        // Sort plugins alphabetically for consistent display
+        plugins.sort_by(|a, b| a.id.cmp(&b.id));
+
+        // Create spinner for current action
+        let spinner = ProgressBar::new_spinner();
+        spinner.set_style(
+            ProgressStyle::default_spinner()
+                .template("  {spinner:.cyan} {msg}")
+                .unwrap()
+        );
+
+        Self {
+            term,
+            plugins,
+            current_plugin: None,
+            current_step: None,
+            spinner,
+        }
+    }
+
+    fn render(&self) {
+        // Clear screen and move to top
+        let _ = self.term.clear_screen();
+        let _ = self.term.move_cursor_to(0, 0);
+
+        // Header
+        println!();
+        println!("  {}  {}", style("▶").cyan().bold(), style("Building Plugins").cyan().bold());
+        println!("  {}", style("─".repeat(50)).dim());
+        println!();
+
+        // Plugin grid (3 columns)
+        let cols = 3;
+        let col_width = 18;
+
+        for (i, plugin) in self.plugins.iter().enumerate() {
+            if i % cols == 0 && i > 0 {
+                println!();
+            }
+
+            let icon = match plugin.status {
+                PluginStatus::Pending => style("○").dim(),
+                PluginStatus::Building => style("●").cyan().bold(),
+                PluginStatus::Success => style("✓").green().bold(),
+                PluginStatus::Failed => style("✗").red().bold(),
+                PluginStatus::Skipped => style("◦").dim(),
+            };
+
+            let name = if plugin.id.len() > col_width - 4 {
+                format!("{}…", &plugin.id[..col_width - 5])
+            } else {
+                plugin.id.clone()
+            };
+
+            let name_styled = match plugin.status {
+                PluginStatus::Pending => style(format!("{:<width$}", name, width = col_width - 3)).dim(),
+                PluginStatus::Building => style(format!("{:<width$}", name, width = col_width - 3)).cyan(),
+                PluginStatus::Success => style(format!("{:<width$}", name, width = col_width - 3)).green(),
+                PluginStatus::Failed => style(format!("{:<width$}", name, width = col_width - 3)).red(),
+                PluginStatus::Skipped => style(format!("{:<width$}", name, width = col_width - 3)).dim(),
+            };
+
+            print!("  {} {}", icon, name_styled);
+        }
+        println!();
+        println!();
+
+        // Current action
+        if let (Some(plugin), Some(step)) = (&self.current_plugin, &self.current_step) {
+            println!("  {} {}: {}", style("→").cyan(), style(plugin).bold(), style(step).dim());
+        }
+
+        // Progress bar
+        let done = self.plugins.iter().filter(|p| p.status == PluginStatus::Success || p.status == PluginStatus::Failed).count();
+        let total = self.plugins.iter().filter(|p| p.status != PluginStatus::Skipped).count();
+        let skipped = self.plugins.iter().filter(|p| p.status == PluginStatus::Skipped).count();
+
+        println!();
+        let bar_width = 40;
+        let filled = if total > 0 { (done * bar_width) / total } else { 0 };
+        let empty = bar_width - filled;
+
+        let bar = format!("{}{}",
+            style("━".repeat(filled)).cyan(),
+            style("─".repeat(empty)).dim()
+        );
+
+        let percent = if total > 0 { (done * 100) / total } else { 0 };
+        let progress_text = if skipped > 0 {
+            format!("{}% ({}/{}, {} skipped)", percent, done, total, skipped)
+        } else {
+            format!("{}% ({}/{})", percent, done, total)
+        };
+
+        println!("  {} {}", bar, style(progress_text).dim());
+        println!();
+    }
+
+    fn start_plugin(&mut self, plugin_id: &str) {
+        if let Some(plugin) = self.plugins.iter_mut().find(|p| p.id == plugin_id) {
+            plugin.status = PluginStatus::Building;
+        }
+        self.current_plugin = Some(plugin_id.to_string());
+        self.current_step = Some("Starting...".to_string());
+        self.render();
+    }
+
+    fn set_step(&mut self, plugin_id: &str, step: &str) {
+        self.current_plugin = Some(plugin_id.to_string());
+        self.current_step = Some(step.to_string());
+        self.render();
+    }
+
+    fn complete_plugin(&mut self, plugin_id: &str, success: bool) {
+        if let Some(plugin) = self.plugins.iter_mut().find(|p| p.id == plugin_id) {
+            plugin.status = if success { PluginStatus::Success } else { PluginStatus::Failed };
+        }
+        self.current_plugin = None;
+        self.current_step = None;
+        self.render();
+    }
+
+    fn finish(&self) {
+        self.spinner.finish_and_clear();
+
+        // Final render
+        let _ = self.term.clear_screen();
+        let _ = self.term.move_cursor_to(0, 0);
+
+        println!();
+        println!("  {}  {}", style("✓").green().bold(), style("Build Complete").green().bold());
+        println!("  {}", style("─".repeat(50)).dim());
+        println!();
+
+        // Final plugin grid
+        let cols = 3;
+        let col_width = 18;
+
+        for (i, plugin) in self.plugins.iter().enumerate() {
+            if i % cols == 0 && i > 0 {
+                println!();
+            }
+
+            let icon = match plugin.status {
+                PluginStatus::Success => style("✓").green().bold(),
+                PluginStatus::Failed => style("✗").red().bold(),
+                PluginStatus::Skipped => style("◦").dim(),
+                _ => style("○").dim(),
+            };
+
+            let name = if plugin.id.len() > col_width - 4 {
+                format!("{}…", &plugin.id[..col_width - 5])
+            } else {
+                plugin.id.clone()
+            };
+
+            let name_styled = match plugin.status {
+                PluginStatus::Success => style(format!("{:<width$}", name, width = col_width - 3)).green(),
+                PluginStatus::Failed => style(format!("{:<width$}", name, width = col_width - 3)).red(),
+                PluginStatus::Skipped => style(format!("{:<width$}", name, width = col_width - 3)).dim(),
+                _ => style(format!("{:<width$}", name, width = col_width - 3)).dim(),
+            };
+
+            print!("  {} {}", icon, name_styled);
+        }
+        println!();
+        println!();
+
+        // Summary
+        let success_count = self.plugins.iter().filter(|p| p.status == PluginStatus::Success).count();
+        let failed_count = self.plugins.iter().filter(|p| p.status == PluginStatus::Failed).count();
+        let skipped_count = self.plugins.iter().filter(|p| p.status == PluginStatus::Skipped).count();
+
+        if failed_count > 0 {
+            println!("  {} built, {} failed{}",
+                style(success_count).green().bold(),
+                style(failed_count).red().bold(),
+                if skipped_count > 0 { format!(", {} skipped", skipped_count) } else { String::new() }
+            );
+        } else {
+            println!("  {} All {} plugins built successfully{}",
+                style("✓").green().bold(),
+                style(success_count).green().bold(),
+                if skipped_count > 0 { format!(" ({} skipped)", skipped_count) } else { String::new() }
+            );
+        }
+        println!();
+    }
+}
+
+// Shared progress state for use in PluginBuilder
+thread_local! {
+    static BUILD_PROGRESS: std::cell::RefCell<Option<*mut BuildProgress>> = const { std::cell::RefCell::new(None) };
+}
+
+fn set_build_progress(progress: Option<&mut BuildProgress>) {
+    BUILD_PROGRESS.with(|p| {
+        *p.borrow_mut() = progress.map(|p| p as *mut BuildProgress);
+    });
+}
+
+fn with_build_progress<F>(f: F)
+where
+    F: FnOnce(&mut BuildProgress),
+{
+    BUILD_PROGRESS.with(|p| {
+        if let Some(ptr) = *p.borrow() {
+            // Safety: We ensure the pointer is valid during the build process
+            unsafe {
+                f(&mut *ptr);
+            }
+        }
+    });
 }
 
 struct PluginBuilder {
@@ -1869,8 +2245,13 @@ impl PluginBuilder {
         // Check if plugin has routes (needs bridge feature)
         let has_routes = self.has_routes();
 
-        println!("Building plugin: {} (backend: {}, frontend: {}, routes: {})",
-            self.plugin_id, has_backend, has_frontend, has_routes);
+        // Report step progress
+        let plugin_id = self.plugin_id.clone();
+        let report_step = |step: &str| {
+            with_build_progress(|p| p.set_step(&plugin_id, step));
+        };
+
+        report_step("Preparing...");
 
         // Clean build directory
         if self.build_dir.exists() {
@@ -1880,14 +2261,14 @@ impl PluginBuilder {
 
         // Build frontend first
         if has_frontend {
-            println!("  Bundling frontend...");
+            report_step("Bundling frontend...");
             self.bundle_frontend()?;
         }
 
         // Frontend-only plugins: output JS file to app/plugins
         if !has_backend {
+            report_step("Installing JS...");
             let js_name = format!("{}.js", self.plugin_id);
-            println!("  Installing {} to app/plugins/...", js_name);
             let src_plugin_js = self.build_dir.join("plugin.js");
             let dest_plugin_js = self.dist_plugins_dir.join(&js_name);
             if src_plugin_js.exists() {
@@ -1895,10 +2276,9 @@ impl PluginBuilder {
             }
 
             // Clean up build directory
-            println!("  Cleaning up build artifacts...");
+            report_step("Cleaning up...");
             self.cleanup_build_dir()?;
 
-            println!("  Done!");
             return Ok(());
         }
 
@@ -1915,23 +2295,23 @@ impl PluginBuilder {
         };
 
         // Create package.json / manifest
+        report_step("Creating manifest...");
         let manifest = self.create_manifest()?;
 
-        println!("  Setting up Rust backend...");
+        report_step("Setting up backend...");
         self.setup_backend_build(&frontend_js, &manifest, has_routes)?;
 
-        println!("  Compiling DLL...");
+        report_step("Compiling DLL...");
         self.compile_backend()?;
 
         // Copy final DLL to app/plugins
-        println!("  Installing {}.dll to app/plugins/...", self.plugin_id);
+        report_step("Installing DLL...");
         self.install_dll()?;
 
         // Clean up build directory
-        println!("  Cleaning up build artifacts...");
+        report_step("Cleaning up...");
         self.cleanup_build_dir()?;
 
-        println!("  Done!");
         Ok(())
     }
 
@@ -2428,14 +2808,16 @@ pub extern "C" fn free_plugin_string(ptr: *mut u8) {{
     fn compile_backend(&self) -> Result<()> {
         let rust_build_dir = self.build_dir.join("rust_build");
 
-        let status = Command::new("cargo")
+        // Capture output to avoid cluttering progress display
+        let output = Command::new("cargo")
             .current_dir(&rust_build_dir)
             .args(&["build", "--release", "--lib"])
-            .status()
+            .output()
             .context("Failed to run cargo build")?;
 
-        if !status.success() {
-            anyhow::bail!("Cargo build failed");
+        if !output.status.success() {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            anyhow::bail!("Cargo build failed:\n{}", stderr);
         }
 
         // Copy compiled binary
@@ -2528,21 +2910,22 @@ pub extern "C" fn free_plugin_string(ptr: *mut u8) {{
             return Ok(());
         }
 
-        let status = if Command::new("bun").arg("--version").output().is_ok() {
+        // Capture output to avoid cluttering progress display
+        let output = if Command::new("bun").arg("--version").output().is_ok() {
             Command::new("bun")
                 .arg("install")
                 .current_dir(&self.plugin_dir)
-                .status()
+                .output()
         } else {
             Command::new("npm")
                 .arg("install")
                 .current_dir(&self.plugin_dir)
-                .status()
+                .output()
         };
 
-        if let Ok(s) = status {
-            if !s.success() {
-                println!("    Warning: Failed to install npm dependencies");
+        if let Ok(o) = output {
+            if !o.status.success() {
+                // Silently continue - npm install failures are often non-critical
             }
         }
 

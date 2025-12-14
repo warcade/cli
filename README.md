@@ -43,6 +43,40 @@ webarcade package
 | `webarcade install <user/repo>` | Install a plugin from GitHub |
 | `webarcade update` | Update the CLI to latest version |
 
+## Build Progress Display
+
+When building plugins, the CLI shows a clean, professional progress display:
+
+```
+  ▶  Building Plugins
+  ──────────────────────────────────────────────────
+
+  ✓ hello-world      ● systemMonitor    ○ themes
+
+  → systemMonitor: Compiling DLL...
+
+  ━━━━━━━━━━━━━━━━━━────────────────────── 66% (2/3)
+```
+
+Features:
+- Real-time status for each plugin (○ pending, ● building, ✓ complete, ✗ failed)
+- Current build step displayed (Bundling frontend, Compiling DLL, etc.)
+- Progress bar with percentage
+- Clean summary on completion
+
+## Updating the CLI
+
+Check for updates and install the latest version:
+
+```bash
+webarcade update
+```
+
+This will:
+- Show your current version
+- Check crates.io for the latest version
+- Prompt to install if an update is available
+
 ## Build Optimizations
 
 The CLI includes smart build caching to speed up development:

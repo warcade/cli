@@ -1,6 +1,6 @@
 [package]
 name = "webarcade"
-version = "0.5.0"
+version = "0.6.0"
 edition = "2021"
 description = "CLI for WebArcade - Create and build native desktop app plugins"
 license = "MIT"
@@ -27,6 +27,8 @@ console = "0.15"
 sha2 = "0.10"
 walkdir = "2.5"
 sysinfo = "0.32"
+indicatif = "0.17"
+ureq = "2.10"
 
 [profile.release]
 opt-level = "z"
