@@ -19,10 +19,14 @@ use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
 use dialoguer::{Input, Select, Confirm, theme::ColorfulTheme};
 use console::style;
+use sha2::{Sha256, Digest};
+use std::collections::HashMap;
 use std::fs;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use sysinfo::System;
+use walkdir::WalkDir;
 
 #[derive(Parser)]
 #[command(name = "webarcade")]
@@ -69,6 +73,10 @@ enum Commands {
         /// Build all plugins
         #[arg(long)]
         all: bool,
+
+        /// Force rebuild even if source hasn't changed
+        #[arg(short, long)]
+        force: bool,
     },
     /// List available plugins in projects/
     List,
@@ -91,6 +99,14 @@ enum Commands {
         /// Use locked mode (embed plugins in binary)
         #[arg(long)]
         locked: bool,
+
+        /// Skip plugin rebuild (use cached builds)
+        #[arg(long)]
+        no_rebuild: bool,
+
+        /// Skip binary/frontend rebuild (use existing build)
+        #[arg(long)]
+        skip_binary: bool,
 
         /// App name (skips prompt)
         #[arg(long)]
@@ -145,11 +161,11 @@ fn run_command(cmd: Commands) -> Result<()> {
         Commands::New { plugin_id, name, author, frontend_only } => {
             create_plugin(&plugin_id, name, author, frontend_only)
         }
-        Commands::Build { plugin_id, all } => {
+        Commands::Build { plugin_id, all, force } => {
             if all {
-                build_all_plugins()
+                build_all_plugins(force)
             } else if let Some(id) = plugin_id {
-                build_plugin(&id)
+                build_plugin(&id, force)
             } else {
                 anyhow::bail!("Please specify a plugin ID or use --all");
             }
@@ -157,8 +173,8 @@ fn run_command(cmd: Commands) -> Result<()> {
         Commands::List => list_plugins(),
         Commands::Dev | Commands::Run => dev_app(),
         Commands::App { locked } => build_app(locked),
-        Commands::Package { skip_prompts, locked, name, version, description, author } => {
-            package_app(skip_prompts, locked, name, version, description, author)
+        Commands::Package { skip_prompts, locked, no_rebuild, skip_binary, name, version, description, author } => {
+            package_app(skip_prompts, locked, no_rebuild, skip_binary, name, version, description, author)
         }
         Commands::Install { repo, force } => install_plugin(&repo, force),
         Commands::Update => update_cli(),
@@ -694,7 +710,7 @@ fn interactive_menu() -> Result<()> {
         println!();
 
         let result = match selection {
-            0 => package_app(false, false, None, None, None, None),
+            0 => package_app(false, false, false, false, None, None, None, None),
             1 => interactive_build_plugin(),
             2 => interactive_create_plugin(),
             3 => interactive_install_plugin(),
@@ -850,6 +866,9 @@ fn build_app(locked: bool) -> Result<()> {
     }
     println!();
 
+    // Kill any running app processes before building
+    kill_running_app_processes()?;
+
     // Build production frontend
     println!("  {} Building frontend (production)...", style("[1/3]").bold().dim());
     let build_status = run_bun_or_npm(&repo_root, &["run", "build:prod"])?;
@@ -951,12 +970,12 @@ fn interactive_build_plugin() -> Result<()> {
     println!();
 
     if selection == 0 {
-        build_all_plugins()
+        build_all_plugins(false)
     } else if selection == options.len() - 1 {
         Ok(()) // Back to menu
     } else {
         let plugin_id = &plugins[selection - 1];
-        build_plugin(plugin_id)
+        build_plugin(plugin_id, false)
     }
 }
 
@@ -1403,8 +1422,273 @@ fn list_plugins() -> Result<()> {
     Ok(())
 }
 
-fn build_all_plugins() -> Result<()> {
+// ============================================================================
+// BUILD CACHE - Track plugin source changes to skip unnecessary rebuilds
+// ============================================================================
+
+/// Cache entry for a single plugin
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+struct PluginCacheEntry {
+    /// Hash of all source files
+    source_hash: String,
+    /// Timestamp of last successful build
+    built_at: u64,
+}
+
+/// Build cache stored in build/.build_cache.json
+#[derive(Debug, Default, serde::Serialize, serde::Deserialize)]
+struct BuildCache {
+    plugins: HashMap<String, PluginCacheEntry>,
+}
+
+impl BuildCache {
+    fn cache_path() -> Result<PathBuf> {
+        Ok(get_repo_root()?.join("build").join(".build_cache.json"))
+    }
+
+    fn load() -> Result<Self> {
+        let path = Self::cache_path()?;
+        if path.exists() {
+            let content = fs::read_to_string(&path)?;
+            Ok(serde_json::from_str(&content).unwrap_or_default())
+        } else {
+            Ok(Self::default())
+        }
+    }
+
+    fn save(&self) -> Result<()> {
+        let path = Self::cache_path()?;
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent)?;
+        }
+        let content = serde_json::to_string_pretty(self)?;
+        fs::write(&path, content)?;
+        Ok(())
+    }
+
+    fn get(&self, plugin_id: &str) -> Option<&PluginCacheEntry> {
+        self.plugins.get(plugin_id)
+    }
+
+    fn set(&mut self, plugin_id: &str, source_hash: String) {
+        let timestamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        self.plugins.insert(plugin_id.to_string(), PluginCacheEntry {
+            source_hash,
+            built_at: timestamp,
+        });
+    }
+}
+
+/// Calculate a hash of all source files in a plugin directory
+fn calculate_plugin_hash(plugin_dir: &Path) -> Result<String> {
+    let mut hasher = Sha256::new();
+    let mut files: Vec<PathBuf> = Vec::new();
+
+    // Collect all relevant source files
+    for entry in WalkDir::new(plugin_dir)
+        .into_iter()
+        .filter_map(|e| e.ok())
+    {
+        let path = entry.path();
+        if path.is_file() {
+            let ext = path.extension().and_then(|e| e.to_str()).unwrap_or("");
+            let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
+
+            // Include source files but skip build artifacts
+            let is_source = matches!(ext, "rs" | "jsx" | "js" | "ts" | "tsx" | "json" | "toml" | "css" | "scss");
+            let is_build_artifact = path.components().any(|c| {
+                let s = c.as_os_str().to_string_lossy();
+                s == "target" || s == "node_modules" || s == ".git"
+            });
+
+            // Skip lock files as they shouldn't trigger rebuilds
+            let is_lock_file = name == "package-lock.json" || name == "bun.lockb" || name == "Cargo.lock";
+
+            if is_source && !is_build_artifact && !is_lock_file {
+                files.push(path.to_path_buf());
+            }
+        }
+    }
+
+    // Sort for consistent ordering
+    files.sort();
+
+    // Hash each file's path and content
+    for file in files {
+        // Include relative path in hash so file renames are detected
+        if let Ok(rel_path) = file.strip_prefix(plugin_dir) {
+            hasher.update(rel_path.to_string_lossy().as_bytes());
+        }
+        if let Ok(content) = fs::read(&file) {
+            hasher.update(&content);
+        }
+    }
+
+    let result = hasher.finalize();
+    Ok(format!("{:x}", result))
+}
+
+/// Check if a plugin needs to be rebuilt
+fn plugin_needs_rebuild(plugin_id: &str, plugin_dir: &Path, dist_plugins_dir: &Path) -> Result<bool> {
+    // Check if output file exists
+    let lib_name = if cfg!(target_os = "windows") {
+        format!("{}.dll", plugin_id)
+    } else if cfg!(target_os = "macos") {
+        format!("lib{}.dylib", plugin_id)
+    } else {
+        format!("lib{}.so", plugin_id)
+    };
+
+    let has_backend = plugin_dir.join("mod.rs").exists() && plugin_dir.join("Cargo.toml").exists();
+    let output_path = if has_backend {
+        dist_plugins_dir.join(&lib_name)
+    } else {
+        dist_plugins_dir.join(format!("{}.js", plugin_id))
+    };
+
+    // If output doesn't exist, definitely need to build
+    if !output_path.exists() {
+        return Ok(true);
+    }
+
+    // Check hash against cache
+    let cache = BuildCache::load()?;
+    let current_hash = calculate_plugin_hash(plugin_dir)?;
+
+    if let Some(entry) = cache.get(plugin_id) {
+        // Rebuild if hash changed
+        Ok(entry.source_hash != current_hash)
+    } else {
+        // No cache entry, need to build
+        Ok(true)
+    }
+}
+
+/// Update the build cache after a successful build
+fn update_build_cache(plugin_id: &str, plugin_dir: &Path) -> Result<()> {
+    let mut cache = BuildCache::load()?;
+    let hash = calculate_plugin_hash(plugin_dir)?;
+    cache.set(plugin_id, hash);
+    cache.save()
+}
+
+// ============================================================================
+// PROCESS MANAGEMENT - Kill running processes before building
+// ============================================================================
+
+/// Kill any running processes that might lock build artifacts
+fn kill_running_app_processes() -> Result<()> {
+    let repo_root = get_repo_root()?;
+    let app_dir = repo_root.join("app");
+
+    // Get the app name from Cargo.toml
+    let cargo_toml_path = app_dir.join("Cargo.toml");
+    let app_name = if cargo_toml_path.exists() {
+        let content = fs::read_to_string(&cargo_toml_path)?;
+        if let Ok(doc) = content.parse::<toml::Value>() {
+            doc.get("package")
+                .and_then(|p| p.get("name"))
+                .and_then(|n| n.as_str())
+                .unwrap_or("webarcade")
+                .to_string()
+        } else {
+            "webarcade".to_string()
+        }
+    } else {
+        "webarcade".to_string()
+    };
+
+    let mut sys = System::new();
+    sys.refresh_processes(sysinfo::ProcessesToUpdate::All, true);
+
+    let mut killed = Vec::new();
+    let exe_name = format!("{}.exe", app_name.to_lowercase());
+    let exe_name_no_ext = app_name.to_lowercase();
+
+    // Also check for processes running from target directory
+    let target_release_dir = app_dir.join("target").join("release");
+    let target_debug_dir = app_dir.join("target").join("debug");
+
+    for (pid, process) in sys.processes() {
+        let name = process.name().to_string_lossy().to_lowercase();
+        let exe_path = process.exe().map(|p| p.to_path_buf());
+
+        let mut should_kill = false;
+
+        // Check by process name
+        if name == exe_name || name == exe_name_no_ext {
+            should_kill = true;
+        }
+
+        // Check by executable path (more reliable)
+        if let Some(ref path) = exe_path {
+            let path_str = path.to_string_lossy().to_lowercase();
+            if path_str.contains(&app_name.to_lowercase()) {
+                // Check if it's running from our target directory
+                if path.starts_with(&target_release_dir) || path.starts_with(&target_debug_dir) {
+                    should_kill = true;
+                }
+                // Or if the exe name matches
+                if let Some(file_name) = path.file_name() {
+                    let file_name_str = file_name.to_string_lossy().to_lowercase();
+                    if file_name_str == exe_name || file_name_str == exe_name_no_ext {
+                        should_kill = true;
+                    }
+                }
+            }
+        }
+
+        if should_kill {
+            let display_name = exe_path
+                .as_ref()
+                .and_then(|p| p.file_name())
+                .map(|n| n.to_string_lossy().to_string())
+                .unwrap_or_else(|| name.clone());
+
+            if process.kill() {
+                killed.push(format!("{} (PID: {})", display_name, pid));
+            }
+        }
+    }
+
+    if !killed.is_empty() {
+        println!("  {} Terminated running processes:", style("!").yellow());
+        for proc in &killed {
+            println!("    - {}", proc);
+        }
+
+        // Wait for processes to fully terminate and release file handles
+        // Windows can be slow to release handles, so we wait a bit longer
+        std::thread::sleep(std::time::Duration::from_millis(1000));
+
+        // Refresh and verify processes are gone
+        sys.refresh_processes(sysinfo::ProcessesToUpdate::All, true);
+        let still_running: Vec<_> = sys.processes()
+            .iter()
+            .filter(|(_, p)| {
+                let name = p.name().to_string_lossy().to_lowercase();
+                name == exe_name || name == exe_name_no_ext
+            })
+            .collect();
+
+        if !still_running.is_empty() {
+            // Try one more time with SIGKILL equivalent
+            for (_, process) in still_running {
+                process.kill();
+            }
+            std::thread::sleep(std::time::Duration::from_millis(500));
+        }
+    }
+
+    Ok(())
+}
+
+fn build_all_plugins(force: bool) -> Result<()> {
     let plugins_dir = get_plugins_dir()?;
+    let dist_plugins_dir = get_dist_plugins_dir()?;
 
     if !plugins_dir.exists() {
         anyhow::bail!("Plugins directory not found: {}", plugins_dir.display());
@@ -1425,41 +1709,118 @@ fn build_all_plugins() -> Result<()> {
         return Ok(());
     }
 
-    println!("Building {} plugins...", plugins.len());
+    println!();
+    println!("{}", style("Building plugins...").cyan().bold());
+    println!();
+
+    // Kill running processes first to avoid file locking issues
+    kill_running_app_processes()?;
+
+    // Check which plugins need rebuilding
+    let mut to_build = Vec::new();
+    let mut skipped = Vec::new();
+
+    for plugin_id in &plugins {
+        let plugin_dir = plugins_dir.join(plugin_id);
+        if force {
+            to_build.push(plugin_id.clone());
+        } else {
+            match plugin_needs_rebuild(plugin_id, &plugin_dir, &dist_plugins_dir) {
+                Ok(true) => to_build.push(plugin_id.clone()),
+                Ok(false) => skipped.push(plugin_id.clone()),
+                Err(_) => to_build.push(plugin_id.clone()), // Build on error
+            }
+        }
+    }
+
+    // Report skipped plugins
+    if !skipped.is_empty() {
+        println!("  {} Skipping {} unchanged plugin(s):", style("→").dim(), skipped.len());
+        for plugin_id in &skipped {
+            println!("    {} {}", style("·").dim(), style(plugin_id).dim());
+        }
+        println!();
+    }
+
+    if to_build.is_empty() {
+        println!("{}", style("All plugins are up to date!").green().bold());
+        return Ok(());
+    }
+
+    println!("  Building {} plugin(s)...", to_build.len());
     println!();
 
     let mut success_count = 0;
     let mut fail_count = 0;
 
-    for plugin_id in &plugins {
-        print!("Building {}... ", plugin_id);
+    for plugin_id in &to_build {
+        print!("  {} {}... ", style("→").cyan(), plugin_id);
         std::io::stdout().flush()?;
 
-        match build_plugin(plugin_id) {
+        match build_plugin_internal(plugin_id) {
             Ok(_) => {
-                println!("OK");
+                println!("{}", style("OK").green());
                 success_count += 1;
             }
             Err(e) => {
-                println!("FAILED: {}", e);
+                println!("{}: {}", style("FAILED").red(), e);
                 fail_count += 1;
             }
         }
     }
 
     println!();
-    println!("Results: {} succeeded, {} failed", success_count, fail_count);
-
     if fail_count > 0 {
+        println!("Results: {} succeeded, {} failed, {} skipped",
+            style(success_count).green(),
+            style(fail_count).red(),
+            style(skipped.len()).dim()
+        );
         anyhow::bail!("Some plugins failed to build");
+    } else {
+        println!("{} {} built, {} skipped",
+            style("✓").green(),
+            success_count,
+            skipped.len()
+        );
     }
 
     Ok(())
 }
 
-fn build_plugin(plugin_id: &str) -> Result<()> {
+fn build_plugin(plugin_id: &str, force: bool) -> Result<()> {
+    let plugins_dir = get_plugins_dir()?;
+    let dist_plugins_dir = get_dist_plugins_dir()?;
+    let plugin_dir = plugins_dir.join(plugin_id);
+
+    // Kill running processes first
+    kill_running_app_processes()?;
+
+    // Check if rebuild is needed (unless forced)
+    if !force {
+        match plugin_needs_rebuild(plugin_id, &plugin_dir, &dist_plugins_dir) {
+            Ok(false) => {
+                println!("{} Plugin '{}' is up to date (use -f to force rebuild)",
+                    style("→").dim(), plugin_id);
+                return Ok(());
+            }
+            _ => {} // Build if needs rebuild or on error
+        }
+    }
+
+    build_plugin_internal(plugin_id)
+}
+
+fn build_plugin_internal(plugin_id: &str) -> Result<()> {
     let builder = PluginBuilder::new(plugin_id)?;
-    builder.build()
+    builder.build()?;
+
+    // Update cache on successful build
+    let plugins_dir = get_plugins_dir()?;
+    let plugin_dir = plugins_dir.join(plugin_id);
+    update_build_cache(plugin_id, &plugin_dir)?;
+
+    Ok(())
 }
 
 struct PluginBuilder {
@@ -2364,6 +2725,8 @@ impl AppConfig {
 fn package_app(
     skip_prompts: bool,
     locked: bool,
+    no_rebuild: bool,
+    skip_binary: bool,
     name: Option<String>,
     version: Option<String>,
     description: Option<String>,
@@ -2473,12 +2836,18 @@ fn package_app(
     }
 
     println!();
+
+    // Kill any running app processes before building
+    kill_running_app_processes()?;
+
     println!("{} Updating configuration...", style("[1/5]").bold().dim());
     config.write_to_cargo_toml(&cargo_toml_path)?;
     println!("  {} Cargo.toml updated", style("✓").green());
 
-    println!("{} Building all plugins...", style("[2/5]").bold().dim());
-    match build_all_plugins() {
+    println!("{} Building all plugins{}...", style("[2/5]").bold().dim(),
+        if no_rebuild { " (using cache)" } else { "" });
+    // Force rebuild unless --no-rebuild is specified
+    match build_all_plugins(!no_rebuild) {
         Ok(_) => println!("  {} All plugins built", style("✓").green()),
         Err(e) => {
             println!("  {} Plugin build failed: {}", style("✗").red(), e);
@@ -2486,35 +2855,43 @@ fn package_app(
         }
     }
 
-    println!("{} Building frontend...", style("[3/5]").bold().dim());
-    let frontend_status = Command::new("bun")
-        .current_dir(&repo_root)
-        .args(["run", "build:prod"])
-        .status()
-        .context("Failed to run bun")?;
+    if skip_binary {
+        println!("{} Skipping frontend build (using existing)", style("[3/5]").bold().dim());
+        println!("  {} Skipped", style("→").dim());
 
-    if !frontend_status.success() {
-        anyhow::bail!("Frontend build failed");
+        println!("{} Skipping binary build (using existing)", style("[4/5]").bold().dim());
+        println!("  {} Skipped", style("→").dim());
+    } else {
+        println!("{} Building frontend...", style("[3/5]").bold().dim());
+        let frontend_status = Command::new("bun")
+            .current_dir(&repo_root)
+            .args(["run", "build:prod"])
+            .status()
+            .context("Failed to run bun")?;
+
+        if !frontend_status.success() {
+            anyhow::bail!("Frontend build failed");
+        }
+        println!("  {} Frontend built", style("✓").green());
+
+        println!("{} Compiling Rust binary...", style("[4/5]").bold().dim());
+        let mut cargo_args = vec!["build", "--release"];
+        if config.locked {
+            cargo_args.push("--features");
+            cargo_args.push("locked-plugins");
+        }
+
+        let cargo_status = Command::new("cargo")
+            .current_dir(&app_dir)
+            .args(&cargo_args)
+            .status()
+            .context("Failed to run cargo build")?;
+
+        if !cargo_status.success() {
+            anyhow::bail!("Cargo build failed");
+        }
+        println!("  {} Binary compiled", style("✓").green());
     }
-    println!("  {} Frontend built", style("✓").green());
-
-    println!("{} Compiling Rust binary...", style("[4/5]").bold().dim());
-    let mut cargo_args = vec!["build", "--release"];
-    if config.locked {
-        cargo_args.push("--features");
-        cargo_args.push("locked-plugins");
-    }
-
-    let cargo_status = Command::new("cargo")
-        .current_dir(&app_dir)
-        .args(&cargo_args)
-        .status()
-        .context("Failed to run cargo build")?;
-
-    if !cargo_status.success() {
-        anyhow::bail!("Cargo build failed");
-    }
-    println!("  {} Binary compiled", style("✓").green());
 
     println!("{} Creating installer...", style("[5/5]").bold().dim());
     let packager_status = Command::new("cargo")

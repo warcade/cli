@@ -1,6 +1,6 @@
 [package]
 name = "webarcade"
-version = "0.4.4"
+version = "0.5.0"
 edition = "2021"
 description = "CLI for WebArcade - Create and build native desktop app plugins"
 license = "MIT"
@@ -24,6 +24,9 @@ toml_edit = "0.22"
 regex = "1.10"
 dialoguer = { version = "0.11", features = ["fuzzy-select"] }
 console = "0.15"
+sha2 = "0.10"
+walkdir = "2.5"
+sysinfo = "0.32"
 
 [profile.release]
 opt-level = "z"

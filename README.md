@@ -38,7 +38,83 @@ webarcade package
 | `webarcade build --all` | Build all plugins |
 | `webarcade list` | List available plugins |
 | `webarcade run` | Build and run the app |
-| `webarcade package` | Package app for distribution |
+| `webarcade app` | Build production app with installer |
+| `webarcade package` | Package app for distribution (interactive) |
+| `webarcade install <user/repo>` | Install a plugin from GitHub |
+| `webarcade update` | Update the CLI to latest version |
+
+## Build Optimizations
+
+The CLI includes smart build caching to speed up development:
+
+### Incremental Plugin Builds
+
+Plugins are only rebuilt when their source files change. The CLI tracks file hashes and skips unchanged plugins:
+
+```bash
+# Only rebuilds plugins that have changed
+webarcade build --all
+
+# Force rebuild all plugins (ignore cache)
+webarcade build --all -f
+```
+
+### Build Flags
+
+| Flag | Description |
+|------|-------------|
+| `-f, --force` | Force rebuild, ignoring cache |
+
+### Package Flags
+
+| Flag | Description |
+|------|-------------|
+| `--locked` | Embed plugins in binary (locked mode) |
+| `--no-rebuild` | Only rebuild changed plugins (use cache) |
+| `--skip-binary` | Skip frontend/binary rebuild (use existing) |
+| `--skip-prompts` | Use current config without prompts |
+
+### Common Workflows
+
+```bash
+# Full rebuild and package
+webarcade package --locked
+
+# Only 1 plugin changed, rebuild just that plugin
+webarcade package --no-rebuild --locked
+
+# Plugin changed, binary unchanged (unlocked mode only)
+webarcade package --no-rebuild --skip-binary
+
+# Quick repackage with no rebuilds
+webarcade package --no-rebuild --skip-binary --skip-prompts
+```
+
+## Automatic Process Management
+
+The CLI automatically terminates running app processes before building to prevent "file in use" errors. This happens automatically when you run:
+
+- `webarcade build`
+- `webarcade app`
+- `webarcade package`
+
+## Build Cache
+
+Plugin build state is stored in `build/.build_cache.json`. The cache tracks:
+
+- SHA-256 hash of all source files (`.rs`, `.jsx`, `.js`, `.ts`, `.tsx`, `.json`, `.toml`, `.css`, `.scss`)
+- Build timestamp
+
+Changes that trigger a rebuild:
+- Any source file content change
+- Adding/removing/renaming files
+- Missing output file (`.dll`, `.js`)
+- Using `--force` flag
+
+Changes that don't trigger a rebuild:
+- Lock file changes (`package-lock.json`, `Cargo.lock`)
+- `node_modules/` or `target/` changes
+- File timestamp changes without content changes
 
 ## License
 
