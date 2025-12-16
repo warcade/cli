@@ -953,14 +953,53 @@ fn dev_app() -> Result<()> {
     println!("{}", style("Running WebArcade in dev mode...").cyan().bold());
     println!();
 
-    // Build frontend first
-    println!("  {} Building frontend...", style("[1/2]").bold().dim());
-    let build_status = run_bun_or_npm(&repo_root, &["run", "build"])?;
+    // Start dev server (builds frontend + watches for changes)
+    println!("  {} Starting dev server...", style("[1/2]").bold().dim());
 
-    if !build_status.success() {
-        anyhow::bail!("Frontend build failed");
-    }
-    println!("    {} Frontend built", style("✓").green());
+    let (pkg_manager, run_arg) = if Command::new("bun").arg("--version").output().is_ok() {
+        ("bun", "run")
+    } else {
+        ("npm", "run")
+    };
+
+    let mut dev_server = Command::new(pkg_manager)
+        .current_dir(&repo_root)
+        .args([run_arg, "dev"])
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .context("Failed to start dev server")?;
+
+    // Wait for initial build to complete (look for "Dev server ready" message)
+    let stdout = dev_server.stdout.take().unwrap();
+    let stderr = dev_server.stderr.take().unwrap();
+
+    // Spawn thread to forward stderr
+    let stderr_handle = std::thread::spawn(move || {
+        use std::io::{BufRead, BufReader};
+        let reader = BufReader::new(stderr);
+        for line in reader.lines().map_while(Result::ok) {
+            eprintln!("    {}", line);
+        }
+    });
+
+    // Wait for dev server to be ready, then continue forwarding in background
+    let stdout_handle = std::thread::spawn(move || {
+        use std::io::{BufRead, BufReader};
+        let reader = BufReader::new(stdout);
+        let mut ready = false;
+        for line in reader.lines().map_while(Result::ok) {
+            println!("    {}", line);
+            if !ready && (line.contains("Dev server ready") || line.contains("watching for changes")) {
+                ready = true;
+                println!("    {} Dev server running (hot reload enabled)", "\x1b[32m✓\x1b[0m");
+            }
+        }
+        ready
+    });
+
+    // Give it a moment to start
+    std::thread::sleep(std::time::Duration::from_millis(500));
 
     // Run the app with cargo run
     println!("  {} Starting app...", style("[2/2]").bold().dim());
@@ -971,6 +1010,11 @@ fn dev_app() -> Result<()> {
         .args(["run", "--release"])
         .status()
         .context("Failed to run cargo")?;
+
+    // Clean up dev server when app exits
+    let _ = dev_server.kill();
+    let _ = stdout_handle.join();
+    let _ = stderr_handle.join();
 
     if !status.success() {
         anyhow::bail!("App failed to run");
