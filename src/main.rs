@@ -1878,9 +1878,6 @@ fn build_all_plugins(force: bool) -> Result<()> {
         return Ok(());
     }
 
-    // Kill running processes first to avoid file locking issues
-    kill_running_app_processes()?;
-
     // Check which plugins need rebuilding
     let mut to_build = Vec::new();
     let mut skipped = Vec::new();
@@ -1950,9 +1947,6 @@ fn build_plugin(plugin_id: &str, force: bool) -> Result<()> {
     let plugins_dir = get_plugins_dir()?;
     let dist_plugins_dir = get_dist_plugins_dir()?;
     let plugin_dir = plugins_dir.join(plugin_id);
-
-    // Kill running processes first
-    kill_running_app_processes()?;
 
     // Check if rebuild is needed (unless forced)
     if !force {
