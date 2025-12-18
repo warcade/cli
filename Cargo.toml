@@ -1,6 +1,6 @@
 [package]
 name = "webarcade"
-version = "0.6.3"
+version = "0.7.0"
 edition = "2021"
 description = "CLI for WebArcade - Create and build native desktop app plugins"
 license = "MIT"

@@ -21,6 +21,7 @@ use dialoguer::{Input, Select, Confirm, theme::ColorfulTheme};
 use console::{style, Term};
 use indicatif::{ProgressBar, ProgressStyle};
 use sha2::{Sha256, Digest};
+use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::fs;
 use std::io::Write;
@@ -29,6 +30,140 @@ use std::process::{Command, Stdio};
 use std::io::BufRead;
 use sysinfo::System;
 use walkdir::WalkDir;
+
+// ============================================================================
+// WebArcade Config Management
+// ============================================================================
+
+/// Plugin configuration in webarcade.config.json
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct PluginConfigEntry {
+    name: String,
+    version: String,
+    #[serde(default)]
+    description: String,
+    #[serde(default)]
+    author: String,
+    path: String,
+    #[serde(default)]
+    has_backend: bool,
+    #[serde(default = "default_has_frontend")]
+    has_frontend: bool,
+    #[serde(default = "default_priority")]
+    priority: i32,
+    #[serde(default = "default_enabled")]
+    enabled: bool,
+    #[serde(default)]
+    routes: Vec<serde_json::Value>,
+}
+
+fn default_has_frontend() -> bool { true }
+fn default_priority() -> i32 { 100 }
+fn default_enabled() -> bool { true }
+
+/// WebArcade configuration file structure
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct WebArcadeConfig {
+    #[serde(default)]
+    #[serde(rename = "$schema")]
+    schema: Option<String>,
+    name: String,
+    version: String,
+    #[serde(default)]
+    default_layout: Option<String>,
+    #[serde(default)]
+    plugins: HashMap<String, PluginConfigEntry>,
+}
+
+impl WebArcadeConfig {
+    /// Load config from file, or create default if it doesn't exist
+    fn load_or_create(config_path: &Path) -> Result<Self> {
+        if config_path.exists() {
+            let content = fs::read_to_string(config_path)?;
+            let config: WebArcadeConfig = serde_json::from_str(&content)?;
+            Ok(config)
+        } else {
+            Ok(Self {
+                schema: Some("./webarcade.config.schema.json".to_string()),
+                name: "WebArcade".to_string(),
+                version: "0.1.0".to_string(),
+                default_layout: Some("welcome".to_string()),
+                plugins: HashMap::new(),
+            })
+        }
+    }
+
+    /// Save config to file
+    fn save(&self, config_path: &Path) -> Result<()> {
+        let content = serde_json::to_string_pretty(self)?;
+        fs::write(config_path, content)?;
+        Ok(())
+    }
+
+    /// Add or update a plugin entry
+    fn upsert_plugin(&mut self, plugin_id: &str, entry: PluginConfigEntry) {
+        self.plugins.insert(plugin_id.to_string(), entry);
+    }
+
+    /// Remove a plugin entry
+    fn remove_plugin(&mut self, plugin_id: &str) {
+        self.plugins.remove(plugin_id);
+    }
+}
+
+fn get_config_path() -> Result<PathBuf> {
+    Ok(get_repo_root()?.join("webarcade.config.json"))
+}
+
+/// Update webarcade.config.json with plugin info after a successful build
+fn update_config_for_plugin(plugin_id: &str, has_backend: bool, has_frontend: bool, routes: Vec<serde_json::Value>) -> Result<()> {
+    let config_path = get_config_path()?;
+    let plugins_dir = get_plugins_dir()?;
+    let plugin_dir = plugins_dir.join(plugin_id);
+
+    // Read plugin metadata from package.json if it exists
+    let package_json_path = plugin_dir.join("package.json");
+    let (name, version, description, author) = if package_json_path.exists() {
+        let content = fs::read_to_string(&package_json_path)?;
+        let pkg: serde_json::Value = serde_json::from_str(&content)?;
+        (
+            pkg.get("name").and_then(|v| v.as_str()).unwrap_or(plugin_id).to_string(),
+            pkg.get("version").and_then(|v| v.as_str()).unwrap_or("1.0.0").to_string(),
+            pkg.get("description").and_then(|v| v.as_str()).unwrap_or("").to_string(),
+            pkg.get("author").and_then(|v| v.as_str()).unwrap_or("").to_string(),
+        )
+    } else {
+        (plugin_id.to_string(), "1.0.0".to_string(), String::new(), String::new())
+    };
+
+    // Determine the path to the built plugin
+    let path = if has_backend {
+        format!("{}.dll", plugin_id) // DLL path (backend handles serving from embedded)
+    } else {
+        format!("{}.js", plugin_id) // JS file in app/plugins/
+    };
+
+    let entry = PluginConfigEntry {
+        name,
+        version,
+        description,
+        author,
+        path,
+        has_backend,
+        has_frontend,
+        priority: default_priority(),
+        enabled: true,
+        routes,
+    };
+
+    let mut config = WebArcadeConfig::load_or_create(&config_path)?;
+    config.upsert_plugin(plugin_id, entry);
+    config.save(&config_path)?;
+
+    Ok(())
+}
 
 #[derive(Parser)]
 #[command(name = "webarcade")]
@@ -1965,12 +2100,20 @@ fn build_plugin(plugin_id: &str, force: bool) -> Result<()> {
 
 fn build_plugin_internal(plugin_id: &str) -> Result<()> {
     let builder = PluginBuilder::new(plugin_id)?;
-    builder.build()?;
+    let build_info = builder.build()?;
 
     // Update cache on successful build
     let plugins_dir = get_plugins_dir()?;
     let plugin_dir = plugins_dir.join(plugin_id);
     update_build_cache(plugin_id, &plugin_dir)?;
+
+    // Update webarcade.config.json with plugin info
+    update_config_for_plugin(
+        plugin_id,
+        build_info.has_backend,
+        build_info.has_frontend,
+        build_info.routes,
+    )?;
 
     Ok(())
 }
@@ -2289,6 +2432,13 @@ where
     });
 }
 
+/// Information about a completed plugin build
+struct PluginBuildInfo {
+    has_backend: bool,
+    has_frontend: bool,
+    routes: Vec<serde_json::Value>,
+}
+
 struct PluginBuilder {
     plugin_id: String,
     plugin_dir: PathBuf,
@@ -2326,7 +2476,7 @@ impl PluginBuilder {
         })
     }
 
-    fn build(&self) -> Result<()> {
+    fn build(&self) -> Result<PluginBuildInfo> {
         let has_backend = self.plugin_dir.join("mod.rs").exists()
             && self.plugin_dir.join("Cargo.toml").exists();
         let has_frontend = self.plugin_dir.join("index.jsx").exists()
@@ -2334,6 +2484,9 @@ impl PluginBuilder {
 
         // Check if plugin has routes (needs bridge feature)
         let has_routes = self.has_routes();
+
+        // Extract routes for config
+        let routes = self.extract_routes().unwrap_or_default();
 
         // Report step progress
         let plugin_id = self.plugin_id.clone();
@@ -2369,7 +2522,11 @@ impl PluginBuilder {
             report_step("Cleaning up...");
             self.cleanup_build_dir()?;
 
-            return Ok(());
+            return Ok(PluginBuildInfo {
+                has_backend: false,
+                has_frontend,
+                routes: routes.clone(),
+            });
         }
 
         // Backend plugins: build DLL with embedded frontend
@@ -2402,7 +2559,11 @@ impl PluginBuilder {
         report_step("Cleaning up...");
         self.cleanup_build_dir()?;
 
-        Ok(())
+        Ok(PluginBuildInfo {
+            has_backend: true,
+            has_frontend,
+            routes,
+        })
     }
 
     /// Clean up the build directory after successful build
