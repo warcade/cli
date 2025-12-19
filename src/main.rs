@@ -56,6 +56,10 @@ struct PluginConfigEntry {
     enabled: bool,
     #[serde(default)]
     routes: Vec<serde_json::Value>,
+    /// Other plugin IDs this plugin depends on
+    #[serde(default)]
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    dependencies: Vec<String>,
 }
 
 fn default_has_frontend() -> bool { true }
@@ -111,6 +115,158 @@ impl WebArcadeConfig {
     fn remove_plugin(&mut self, plugin_id: &str) {
         self.plugins.remove(plugin_id);
     }
+
+    /// Recalculate priorities based on dependency graph.
+    /// Plugins with no dependencies get priority 0, those that depend on them get 1, etc.
+    fn recalculate_priorities(&mut self) -> Result<()> {
+        use std::collections::HashSet;
+
+        // Calculate depth for each plugin (how many levels of dependencies it has)
+        fn calc_depth(
+            plugin_id: &str,
+            plugins: &HashMap<String, PluginConfigEntry>,
+            cache: &mut HashMap<String, i32>,
+            visiting: &mut HashSet<String>,
+        ) -> Result<i32> {
+            if let Some(&depth) = cache.get(plugin_id) {
+                return Ok(depth);
+            }
+
+            if visiting.contains(plugin_id) {
+                anyhow::bail!("Circular dependency detected involving plugin '{}'", plugin_id);
+            }
+
+            let deps = match plugins.get(plugin_id) {
+                Some(entry) => entry.dependencies.clone(),
+                None => return Ok(0), // Unknown plugin, treat as no deps
+            };
+
+            if deps.is_empty() {
+                cache.insert(plugin_id.to_string(), 0);
+                return Ok(0);
+            }
+
+            visiting.insert(plugin_id.to_string());
+
+            let mut max_dep_depth = 0;
+            for dep in &deps {
+                let dep_depth = calc_depth(dep, plugins, cache, visiting)?;
+                max_dep_depth = max_dep_depth.max(dep_depth + 1);
+            }
+
+            visiting.remove(plugin_id);
+            cache.insert(plugin_id.to_string(), max_dep_depth);
+            Ok(max_dep_depth)
+        }
+
+        let mut depth_cache: HashMap<String, i32> = HashMap::new();
+        let mut visiting: HashSet<String> = HashSet::new();
+
+        // Calculate depths for all plugins
+        let plugin_ids: Vec<String> = self.plugins.keys().cloned().collect();
+        for plugin_id in &plugin_ids {
+            calc_depth(plugin_id, &self.plugins, &mut depth_cache, &mut visiting)?;
+        }
+
+        // Update priorities based on depth (lower depth = lower priority number = loads first)
+        for (plugin_id, entry) in &mut self.plugins {
+            let depth = depth_cache.get(plugin_id).copied().unwrap_or(0);
+            entry.priority = depth;
+        }
+
+        Ok(())
+    }
+
+    /// Get build order respecting dependencies (topological sort).
+    /// Returns plugin IDs in the order they should be built.
+    fn get_build_order(&self, plugin_ids: &[String]) -> Result<Vec<String>> {
+        use std::collections::HashSet;
+
+        // First, read dependencies from package.json for plugins not yet in config
+        let plugins_dir = get_plugins_dir()?;
+        let mut all_deps: HashMap<String, Vec<String>> = HashMap::new();
+
+        for plugin_id in plugin_ids {
+            // Try to get deps from config first, then from package.json
+            let deps = if let Some(entry) = self.plugins.get(plugin_id) {
+                entry.dependencies.clone()
+            } else {
+                // Read from package.json
+                let package_json_path = plugins_dir.join(plugin_id).join("package.json");
+                if package_json_path.exists() {
+                    let content = fs::read_to_string(&package_json_path)?;
+                    let pkg: serde_json::Value = serde_json::from_str(&content)?;
+                    pkg.get("pluginDependencies")
+                        .and_then(|v| v.as_array())
+                        .map(|arr| arr.iter()
+                            .filter_map(|v| v.as_str().map(String::from))
+                            .collect())
+                        .unwrap_or_default()
+                } else {
+                    Vec::new()
+                }
+            };
+            all_deps.insert(plugin_id.clone(), deps);
+        }
+
+        // Topological sort
+        let mut order = Vec::new();
+        let mut visited = HashSet::new();
+        let mut visiting = HashSet::new();
+
+        fn visit(
+            plugin_id: &str,
+            all_deps: &HashMap<String, Vec<String>>,
+            plugin_ids: &[String],
+            order: &mut Vec<String>,
+            visited: &mut HashSet<String>,
+            visiting: &mut HashSet<String>,
+        ) -> Result<()> {
+            if visited.contains(plugin_id) {
+                return Ok(());
+            }
+            if visiting.contains(plugin_id) {
+                anyhow::bail!("Circular dependency detected involving plugin '{}'", plugin_id);
+            }
+
+            visiting.insert(plugin_id.to_string());
+
+            if let Some(deps) = all_deps.get(plugin_id) {
+                for dep in deps {
+                    // Only visit if it's in our build list
+                    if plugin_ids.contains(dep) {
+                        visit(dep, all_deps, plugin_ids, order, visited, visiting)?;
+                    }
+                }
+            }
+
+            visiting.remove(plugin_id);
+            visited.insert(plugin_id.to_string());
+            order.push(plugin_id.to_string());
+            Ok(())
+        }
+
+        for plugin_id in plugin_ids {
+            visit(plugin_id, &all_deps, plugin_ids, &mut order, &mut visited, &mut visiting)?;
+        }
+
+        Ok(order)
+    }
+
+    /// Validate that all plugin dependencies exist
+    fn validate_dependencies(&self) -> Result<Vec<String>> {
+        let mut missing = Vec::new();
+
+        for (plugin_id, entry) in &self.plugins {
+            for dep in &entry.dependencies {
+                if !self.plugins.contains_key(dep) {
+                    missing.push(format!("Plugin '{}' depends on '{}' which is not installed", plugin_id, dep));
+                }
+            }
+        }
+
+        Ok(missing)
+    }
 }
 
 fn get_config_path() -> Result<PathBuf> {
@@ -125,17 +281,27 @@ fn update_config_for_plugin(plugin_id: &str, has_backend: bool, has_frontend: bo
 
     // Read plugin metadata from package.json if it exists
     let package_json_path = plugin_dir.join("package.json");
-    let (name, version, description, author) = if package_json_path.exists() {
+    let (name, version, description, author, dependencies) = if package_json_path.exists() {
         let content = fs::read_to_string(&package_json_path)?;
         let pkg: serde_json::Value = serde_json::from_str(&content)?;
+
+        // Read plugin dependencies from "pluginDependencies" array
+        let deps: Vec<String> = pkg.get("pluginDependencies")
+            .and_then(|v| v.as_array())
+            .map(|arr| arr.iter()
+                .filter_map(|v| v.as_str().map(String::from))
+                .collect())
+            .unwrap_or_default();
+
         (
             pkg.get("name").and_then(|v| v.as_str()).unwrap_or(plugin_id).to_string(),
             pkg.get("version").and_then(|v| v.as_str()).unwrap_or("1.0.0").to_string(),
             pkg.get("description").and_then(|v| v.as_str()).unwrap_or("").to_string(),
             pkg.get("author").and_then(|v| v.as_str()).unwrap_or("").to_string(),
+            deps,
         )
     } else {
-        (plugin_id.to_string(), "1.0.0".to_string(), String::new(), String::new())
+        (plugin_id.to_string(), "1.0.0".to_string(), String::new(), String::new(), Vec::new())
     };
 
     // Determine the path to the built plugin
@@ -153,9 +319,10 @@ fn update_config_for_plugin(plugin_id: &str, has_backend: bool, has_frontend: bo
         path,
         has_backend,
         has_frontend,
-        priority: default_priority(),
+        priority: default_priority(), // Will be recalculated after all plugins are built
         enabled: true,
         routes,
+        dependencies,
     };
 
     let mut config = WebArcadeConfig::load_or_create(&config_path)?;
@@ -2037,6 +2204,17 @@ fn build_all_plugins(force: bool) -> Result<()> {
         return Ok(());
     }
 
+    // Sort build order based on dependencies (dependencies first)
+    let config_path = get_config_path()?;
+    let config = WebArcadeConfig::load_or_create(&config_path)?;
+    let to_build = match config.get_build_order(&to_build) {
+        Ok(order) => order,
+        Err(e) => {
+            println!("  {} {}", style("⚠").yellow(), style(format!("Dependency resolution warning: {}", e)).yellow());
+            to_build // Fall back to original order
+        }
+    };
+
     // Create progress display
     let mut progress = BuildProgress::new(&to_build, &skipped);
     progress.render();
@@ -2075,6 +2253,23 @@ fn build_all_plugins(force: bool) -> Result<()> {
         anyhow::bail!("Some plugins failed to build");
     }
 
+    // Recalculate priorities based on dependency graph and save
+    let mut config = WebArcadeConfig::load_or_create(&config_path)?;
+    if let Err(e) = config.recalculate_priorities() {
+        println!("  {} {}", style("⚠").yellow(), style(format!("Priority calculation warning: {}", e)).yellow());
+    }
+    config.save(&config_path)?;
+
+    // Validate dependencies and warn about missing ones
+    let missing = config.validate_dependencies()?;
+    if !missing.is_empty() {
+        println!();
+        println!("  {} {}", style("⚠").yellow().bold(), style("Missing dependencies:").yellow());
+        for msg in &missing {
+            println!("    {} {}", style("→").dim(), msg);
+        }
+    }
+
     Ok(())
 }
 
@@ -2095,7 +2290,15 @@ fn build_plugin(plugin_id: &str, force: bool) -> Result<()> {
         }
     }
 
-    build_plugin_internal(plugin_id)
+    build_plugin_internal(plugin_id)?;
+
+    // Recalculate priorities after building
+    let config_path = get_config_path()?;
+    let mut config = WebArcadeConfig::load_or_create(&config_path)?;
+    config.recalculate_priorities()?;
+    config.save(&config_path)?;
+
+    Ok(())
 }
 
 fn build_plugin_internal(plugin_id: &str) -> Result<()> {
