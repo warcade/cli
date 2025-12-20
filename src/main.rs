@@ -441,6 +441,16 @@ enum Commands {
     Update,
     /// Uninstall webarcade CLI
     Uninstall,
+    /// Sync project's app folder with latest core (updates Rust backend)
+    Sync {
+        /// Git branch to sync from (default: main)
+        #[arg(short, long, default_value = "main")]
+        branch: String,
+
+        /// Show what would be updated without making changes
+        #[arg(long)]
+        dry_run: bool,
+    },
 }
 
 fn main() {
@@ -483,6 +493,7 @@ fn run_command(cmd: Commands) -> Result<()> {
         Commands::Install { repo, force } => install_plugin(&repo, force),
         Commands::Update => update_cli(),
         Commands::Uninstall => uninstall_cli(),
+        Commands::Sync { branch, dry_run } => sync_project(&branch, dry_run),
     }
 }
 
@@ -1244,6 +1255,152 @@ fn init_project(project_name: &str, branch: &str) -> Result<()> {
     println!("    {} {}", style("webarcade run").cyan(), "");
     println!();
 
+    Ok(())
+}
+
+fn sync_project(branch: &str, dry_run: bool) -> Result<()> {
+    let repo_root = get_repo_root()?;
+    let app_src_dir = repo_root.join("app").join("src");
+
+    // Check if this is a webarcade project
+    if !app_src_dir.exists() {
+        anyhow::bail!("Not a WebArcade project (no app/src directory found). Run this from a project root.");
+    }
+
+    println!();
+    println!("{}", style("Syncing project with latest core...").cyan().bold());
+    println!();
+
+    // Create temp directory for cloning
+    let temp_dir = std::env::temp_dir().join(format!("webarcade-sync-{}", std::process::id()));
+    if temp_dir.exists() {
+        fs::remove_dir_all(&temp_dir)?;
+    }
+
+    // Clone the core repository
+    println!("  {} Fetching latest core...", style("[1/3]").bold().dim());
+    let clone_status = Command::new("git")
+        .args([
+            "clone",
+            "--depth", "1",
+            "--branch", branch,
+            "https://github.com/warcade/core.git",
+            temp_dir.to_str().unwrap(),
+        ])
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .context("Failed to run git clone. Is git installed?")?;
+
+    if !clone_status.success() {
+        anyhow::bail!("Failed to fetch core repository");
+    }
+    println!("    {} Fetched latest from branch '{}'", style("✓").green(), branch);
+
+    // Compare and sync files
+    println!("  {} Comparing files...", style("[2/3]").bold().dim());
+    let core_src_dir = temp_dir.join("app").join("src");
+
+    if !core_src_dir.exists() {
+        fs::remove_dir_all(&temp_dir)?;
+        anyhow::bail!("Core repository structure is invalid (no app/src)");
+    }
+
+    let mut updated_files = Vec::new();
+    let mut new_files = Vec::new();
+
+    // Walk through core's app/src and compare with local
+    sync_directory(&core_src_dir, &app_src_dir, &core_src_dir, &mut updated_files, &mut new_files, dry_run)?;
+
+    println!("  {} Syncing files...", style("[3/3]").bold().dim());
+
+    if updated_files.is_empty() && new_files.is_empty() {
+        println!("    {} Already up to date!", style("✓").green());
+    } else {
+        if dry_run {
+            println!();
+            println!("  {} (dry run - no changes made)", style("Would update:").yellow());
+        }
+
+        for file in &new_files {
+            println!("    {} {}", style("+").green(), file);
+        }
+        for file in &updated_files {
+            println!("    {} {}", style("~").yellow(), file);
+        }
+
+        if !dry_run {
+            println!();
+            println!("    {} Updated {} file(s)", style("✓").green(), updated_files.len() + new_files.len());
+        }
+    }
+
+    // Cleanup temp directory
+    fs::remove_dir_all(&temp_dir)?;
+
+    println!();
+    if !dry_run && (!updated_files.is_empty() || !new_files.is_empty()) {
+        println!("{}", style("╔══════════════════════════════════════════╗").green());
+        println!("{}", style("║          Project synced!                 ║").green());
+        println!("{}", style("╚══════════════════════════════════════════╝").green());
+        println!();
+        println!("  Run {} to rebuild the app", style("cargo build --release").cyan());
+        println!();
+    }
+
+    Ok(())
+}
+
+/// Recursively sync a directory, comparing and copying files
+fn sync_directory(
+    core_dir: &Path,
+    local_dir: &Path,
+    base_core_dir: &Path,
+    updated_files: &mut Vec<String>,
+    new_files: &mut Vec<String>,
+    dry_run: bool,
+) -> Result<()> {
+    for entry in fs::read_dir(core_dir)? {
+        let entry = entry?;
+        let path = entry.path();
+        let file_name = entry.file_name();
+        let local_path = local_dir.join(&file_name);
+
+        // Get relative path for display
+        let rel_path = path.strip_prefix(base_core_dir)
+            .unwrap_or(&path)
+            .to_string_lossy()
+            .to_string();
+
+        if path.is_dir() {
+            // Recursively handle subdirectories
+            if !local_path.exists() && !dry_run {
+                fs::create_dir_all(&local_path)?;
+            }
+            sync_directory(&path, &local_path, base_core_dir, updated_files, new_files, dry_run)?;
+        } else {
+            // Compare files
+            let core_content = fs::read(&path)?;
+
+            if local_path.exists() {
+                let local_content = fs::read(&local_path)?;
+                if core_content != local_content {
+                    updated_files.push(rel_path);
+                    if !dry_run {
+                        fs::write(&local_path, &core_content)?;
+                    }
+                }
+            } else {
+                new_files.push(rel_path);
+                if !dry_run {
+                    if let Some(parent) = local_path.parent() {
+                        fs::create_dir_all(parent)?;
+                    }
+                    fs::write(&local_path, &core_content)?;
+                }
+            }
+        }
+    }
     Ok(())
 }
 
