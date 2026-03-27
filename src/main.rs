@@ -1792,7 +1792,7 @@ fn create_plugin(plugin_id: &str, name: Option<String>, author: Option<String>, 
 
     // Create index.jsx (always required)
     let index_jsx = if frontend_only {
-        format!(r#"import {{ plugin }} from '@/api/plugin';
+        format!(r#"import {{ plugin }} from 'webarcade/plugin';
 
 export default plugin({{
     id: '{plugin_id}',
@@ -1835,7 +1835,7 @@ export default plugin({{
 }});
 "#)
     } else {
-        format!(r#"import {{ plugin }} from '@/api/plugin';
+        format!(r#"import {{ plugin }} from 'webarcade/plugin';
 import Viewport from './viewport';
 
 export default plugin({{
@@ -1897,7 +1897,7 @@ export default plugin({{
     if !frontend_only {
         // Create viewport.jsx
         let viewport_jsx = format!(r#"import {{ createSignal, onMount }} from 'solid-js';
-import {{ api }} from '@/api/bridge';
+import {{ api }} from 'webarcade/bridge';
 
 export default function Viewport() {{
     const [message, setMessage] = createSignal('Loading...');
