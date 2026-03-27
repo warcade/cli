@@ -2843,7 +2843,9 @@ impl PluginBuilder {
     }
 
     /// Get the native library filename for the target platform
+    /// Rust converts hyphens to underscores in crate/library names
     fn lib_name(&self) -> String {
+        let crate_name = self.plugin_id.replace('-', "_");
         let is_windows;
         let is_macos;
         if let Some(ref target) = self.target {
@@ -2854,11 +2856,11 @@ impl PluginBuilder {
             is_macos = cfg!(target_os = "macos");
         }
         if is_windows {
-            format!("{}.dll", self.plugin_id)
+            format!("{}.dll", crate_name)
         } else if is_macos {
-            format!("lib{}.dylib", self.plugin_id)
+            format!("lib{}.dylib", crate_name)
         } else {
-            format!("lib{}.so", self.plugin_id)
+            format!("lib{}.so", crate_name)
         }
     }
 
@@ -3655,15 +3657,22 @@ pub extern "C" fn free_plugin_string(ptr: *mut u8) {{
     }
 
     fn install_dll(&self) -> Result<()> {
+        // Source uses Rust naming (underscores)
         let lib_name = self.lib_name();
-
         let src_path = self.build_dir.join(&lib_name);
         if !src_path.exists() {
             anyhow::bail!("Compiled library not found: {}", src_path.display());
         }
 
-        // Copy to build/plugins directory
-        let dest_path = self.dist_plugins_dir.join(&lib_name);
+        // Destination uses plugin ID (may have hyphens) for loader compatibility
+        let dest_name = if cfg!(target_os = "windows") || self.target.as_ref().map(|t| t.contains("windows")).unwrap_or(false) {
+            format!("{}.dll", self.plugin_id)
+        } else if cfg!(target_os = "macos") || self.target.as_ref().map(|t| t.contains("apple") || t.contains("darwin")).unwrap_or(false) {
+            format!("lib{}.dylib", self.plugin_id)
+        } else {
+            format!("lib{}.so", self.plugin_id)
+        };
+        let dest_path = self.dist_plugins_dir.join(&dest_name);
         fs::copy(&src_path, &dest_path)?;
 
         Ok(())
