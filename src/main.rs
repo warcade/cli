@@ -381,6 +381,10 @@ enum Commands {
         /// Force rebuild even if source hasn't changed
         #[arg(short, long)]
         force: bool,
+
+        /// Cross-compile for a specific Rust target triple (e.g. x86_64-apple-darwin)
+        #[arg(long)]
+        target: Option<String>,
     },
     /// List available plugins in projects/
     List,
@@ -475,11 +479,11 @@ fn run_command(cmd: Commands) -> Result<()> {
         Commands::New { plugin_id, name, author, frontend_only } => {
             create_plugin(&plugin_id, name, author, frontend_only)
         }
-        Commands::Build { plugin_id, all, force } => {
+        Commands::Build { plugin_id, all, force, target } => {
             if all {
-                build_all_plugins(force)
+                build_all_plugins(force, target.as_deref())
             } else if let Some(id) = plugin_id {
-                build_plugin(&id, force)
+                build_plugin(&id, force, target.as_deref())
             } else {
                 anyhow::bail!("Please specify a plugin ID or use --all");
             }
@@ -1598,12 +1602,12 @@ fn interactive_build_plugin() -> Result<()> {
     println!();
 
     if selection == 0 {
-        build_all_plugins(false)
+        build_all_plugins(false, None)
     } else if selection == options.len() - 1 {
         Ok(()) // Back to menu
     } else {
         let plugin_id = &plugins[selection - 1];
-        build_plugin(plugin_id, false)
+        build_plugin(plugin_id, false, None)
     }
 }
 
@@ -2314,7 +2318,7 @@ fn kill_running_app_processes() -> Result<()> {
     Ok(())
 }
 
-fn build_all_plugins(force: bool) -> Result<()> {
+fn build_all_plugins(force: bool, target: Option<&str>) -> Result<()> {
     let plugins_dir = get_plugins_dir()?;
     let dist_plugins_dir = get_dist_plugins_dir()?;
 
@@ -2384,7 +2388,7 @@ fn build_all_plugins(force: bool) -> Result<()> {
     for plugin_id in &to_build {
         progress.start_plugin(plugin_id);
 
-        match build_plugin_internal(plugin_id) {
+        match build_plugin_internal(plugin_id, target) {
             Ok(_) => {
                 progress.complete_plugin(plugin_id, true);
             }
@@ -2430,7 +2434,7 @@ fn build_all_plugins(force: bool) -> Result<()> {
     Ok(())
 }
 
-fn build_plugin(plugin_id: &str, force: bool) -> Result<()> {
+fn build_plugin(plugin_id: &str, force: bool, target: Option<&str>) -> Result<()> {
     let plugins_dir = get_plugins_dir()?;
     let dist_plugins_dir = get_dist_plugins_dir()?;
     let plugin_dir = plugins_dir.join(plugin_id);
@@ -2447,7 +2451,7 @@ fn build_plugin(plugin_id: &str, force: bool) -> Result<()> {
         }
     }
 
-    build_plugin_internal(plugin_id)?;
+    build_plugin_internal(plugin_id, target)?;
 
     // Recalculate priorities after building
     let config_path = get_config_path()?;
@@ -2458,8 +2462,8 @@ fn build_plugin(plugin_id: &str, force: bool) -> Result<()> {
     Ok(())
 }
 
-fn build_plugin_internal(plugin_id: &str) -> Result<()> {
-    let builder = PluginBuilder::new(plugin_id)?;
+fn build_plugin_internal(plugin_id: &str, target: Option<&str>) -> Result<()> {
+    let builder = PluginBuilder::new(plugin_id, target)?;
     let build_info = builder.build()?;
 
     // Update cache on successful build
@@ -2805,10 +2809,11 @@ struct PluginBuilder {
     build_dir: PathBuf,
     dist_plugins_dir: PathBuf,
     repo_root: PathBuf,
+    target: Option<String>,
 }
 
 impl PluginBuilder {
-    fn new(plugin_id: &str) -> Result<Self> {
+    fn new(plugin_id: &str, target: Option<&str>) -> Result<Self> {
         let repo_root = get_repo_root()?;
         let plugins_dir = get_plugins_dir()?;
         let plugin_dir = plugins_dir.join(plugin_id);
@@ -2833,7 +2838,28 @@ impl PluginBuilder {
             build_dir,
             dist_plugins_dir,
             repo_root,
+            target: target.map(|s| s.to_string()),
         })
+    }
+
+    /// Get the native library filename for the target platform
+    fn lib_name(&self) -> String {
+        let is_windows;
+        let is_macos;
+        if let Some(ref target) = self.target {
+            is_windows = target.contains("windows");
+            is_macos = target.contains("apple") || target.contains("darwin");
+        } else {
+            is_windows = cfg!(target_os = "windows");
+            is_macos = cfg!(target_os = "macos");
+        }
+        if is_windows {
+            format!("{}.dll", self.plugin_id)
+        } else if is_macos {
+            format!("lib{}.dylib", self.plugin_id)
+        } else {
+            format!("lib{}.so", self.plugin_id)
+        }
     }
 
     fn build(&self) -> Result<PluginBuildInfo> {
@@ -3420,9 +3446,17 @@ pub extern "C" fn free_plugin_string(ptr: *mut u8) {{
         let rust_build_dir = self.build_dir.join("rust_build");
 
         // Spawn cargo with piped stderr to capture progress
+        let mut args = vec!["build", "--release", "--lib"];
+        let target_string;
+        if let Some(ref target) = self.target {
+            target_string = target.clone();
+            args.push("--target");
+            args.push(&target_string);
+        }
+
         let mut child = Command::new("cargo")
             .current_dir(&rust_build_dir)
-            .args(&["build", "--release", "--lib"])
+            .args(&args)
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .spawn()
@@ -3517,15 +3551,13 @@ pub extern "C" fn free_plugin_string(ptr: *mut u8) {{
     }
 
     fn copy_compiled_binary(&self, rust_build_dir: &Path) -> Result<()> {
-        let target_dir = rust_build_dir.join("target").join("release");
-
-        let lib_name = if cfg!(target_os = "windows") {
-            format!("{}.dll", self.plugin_id)
-        } else if cfg!(target_os = "macos") {
-            format!("lib{}.dylib", self.plugin_id)
+        let target_dir = if let Some(ref target) = self.target {
+            rust_build_dir.join("target").join(target).join("release")
         } else {
-            format!("lib{}.so", self.plugin_id)
+            rust_build_dir.join("target").join("release")
         };
+
+        let lib_name = self.lib_name();
 
         let src_path = target_dir.join(&lib_name);
         if src_path.exists() {
@@ -3623,14 +3655,7 @@ pub extern "C" fn free_plugin_string(ptr: *mut u8) {{
     }
 
     fn install_dll(&self) -> Result<()> {
-        // Find the compiled DLL in build directory
-        let lib_name = if cfg!(target_os = "windows") {
-            format!("{}.dll", self.plugin_id)
-        } else if cfg!(target_os = "macos") {
-            format!("lib{}.dylib", self.plugin_id)
-        } else {
-            format!("lib{}.so", self.plugin_id)
-        };
+        let lib_name = self.lib_name();
 
         let src_path = self.build_dir.join(&lib_name);
         if !src_path.exists() {
@@ -3920,7 +3945,7 @@ fn package_app(
     println!("{} Building all plugins{}...", style("[2/5]").bold().dim(),
         if no_rebuild { " (using cache)" } else { "" });
     // Force rebuild unless --no-rebuild is specified
-    match build_all_plugins(!no_rebuild) {
+    match build_all_plugins(!no_rebuild, None) {
         Ok(_) => println!("  {} All plugins built", style("✓").green()),
         Err(e) => {
             println!("  {} Plugin build failed: {}", style("✗").red(), e);
